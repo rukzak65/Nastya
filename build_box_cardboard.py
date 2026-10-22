@@ -219,6 +219,8 @@ def build(top_down=False):
     ground_up = q@Vector((0,1,0))
     ground_up.z = 0
     ground_up.normalize()
+    softbox = object('Скользящий софтбокс — отражение ламинации')
+    softbox.empty_display_size = .015
 
     def ease(t):
         t = max(0,min(1,t))
@@ -253,75 +255,102 @@ def build(top_down=False):
             end_normal = Vector((0,math.sin(math.radians(115)),-math.cos(math.radians(115))))
             camera.location = target+start_offset.lerp(end_normal*.355,zoom)
             look(camera,target)
+        # A reflected strip light follows the lid. Its reflection travels across
+        # the print during the move and settles before the final reading hold.
+        normal = (lid_panel.matrix_world.to_3x3() @ Vector((0,0,1))).normalized()
+        view = (camera.location-lid_center).normalized()
+        if normal.dot(view)<0: normal.negate()
+        reflected = 2*normal.dot(view)*normal-view
+        tangent = (lid_panel.matrix_world.to_3x3() @ Vector((1,0,0))).normalized()
+        scan = .065*math.cos(2*math.pi*min(t,5)/3)*(1-.7*ease((t-4)/1))
+        softbox.location = lid_center + reflected*.22 + tangent*scan
         frame = 1+pose*(FPS//POSE_FPS)
-        for o in (move,lid,left,right,camera):
+        for o in (move,lid,left,right,camera,softbox):
             o.keyframe_insert(data_path='location',frame=frame)
             o.keyframe_insert(data_path='rotation_euler',frame=frame)
-    for o in (move,lid,left,right,camera):
+    for o in (move,lid,left,right,camera,softbox):
         constant_keys(o)
     if top_down:constant_keys(data)
 
-    # Fine paper grain and a low-intensity glossy coat on the printed cardboard.
-    # Card artwork remains unchanged. The original printed colors are preserved.
+    # Printed coated paperboard: two scales of pulp grain, shallow paper relief,
+    # warm exposed edges, and a distinct elongated softbox reflection. All print
+    # UVs and source pixels are preserved. The deterministic reflection does not
+    # need stochastic glossy rays or text-blurring denoising.
     for original, mat in materials.items():
         if original.name not in ('Наружный дизайн','Внутренний дизайн','Торцы картона'):
             continue
         nt=mat.node_tree
         emission=next(n for n in nt.nodes if n.type=='EMISSION')
         output=next(n for n in nt.nodes if n.type=='OUTPUT_MATERIAL')
+        def math_node(operation, a=None, b=None, c=None, label=''):
+            node=nt.nodes.new('ShaderNodeMath');node.operation=operation;node.label=label
+            for i,value in enumerate((a,b,c)):
+                if value is None:continue
+                if isinstance(value,(float,int)):node.inputs[i].default_value=value
+                else:nt.links.new(value,node.inputs[i])
+            return node.outputs[0]
+        def vector_node(operation, a=None, b=None):
+            node=nt.nodes.new('ShaderNodeVectorMath');node.operation=operation
+            for i,value in enumerate((a,b)):
+                if value is None:continue
+                if isinstance(value,tuple):node.inputs[i].default_value=value
+                else:nt.links.new(value,node.inputs[i])
+            return node.outputs['Value'] if operation=='DOT_PRODUCT' else node.outputs['Vector']
         coordinates=nt.nodes.new('ShaderNodeTexCoord')
-        noise=nt.nodes.new('ShaderNodeTexNoise')
-        noise.inputs['Scale'].default_value=7000
+        noise=nt.nodes.new('ShaderNodeTexNoise');noise.label='Мелкое бумажное зерно'
+        noise.inputs['Scale'].default_value=1700
         noise.inputs['Detail'].default_value=2
-        noise.inputs['Roughness'].default_value=.65
+        noise.inputs['Roughness'].default_value=.68
         nt.links.new(coordinates.outputs['Object'],noise.inputs['Vector'])
-        grain=nt.nodes.new('ShaderNodeMath');grain.operation='MULTIPLY_ADD'
-        grain.inputs[1].default_value=.008;grain.inputs[2].default_value=.992
-        nt.links.new(noise.outputs['Fac'],grain.inputs[0])
+        stretched=vector_node('MULTIPLY',coordinates.outputs['Object'],(1,5,1))
+        fibers=nt.nodes.new('ShaderNodeTexNoise');fibers.label='Короткие волокна картона'
+        fibers.inputs['Scale'].default_value=420
+        fibers.inputs['Detail'].default_value=2
+        nt.links.new(stretched,fibers.inputs['Vector'])
+        pulp=math_node('ADD',math_node('MULTIPLY',noise.outputs['Fac'],.65),
+                       math_node('MULTIPLY',fibers.outputs['Fac'],.35))
+        grain=math_node('MULTIPLY_ADD',pulp,.28,.80,label='Фактура печатного картона')
         multiply=nt.nodes.new('ShaderNodeMixRGB');multiply.blend_type='MULTIPLY'
         multiply.inputs[0].default_value=1
-        nt.links.new(emission.inputs['Color'].links[0].from_socket,multiply.inputs[1])
-        nt.links.new(grain.outputs[0],multiply.inputs[2])
+        if original.name=='Торцы картона':
+            multiply.inputs[1].default_value=rgba('B7A78C')
+        else:
+            nt.links.new(emission.inputs['Color'].links[0].from_socket,multiply.inputs[1])
+        nt.links.new(grain,multiply.inputs[2])
         nt.links.new(multiply.outputs[0],emission.inputs['Color'])
         if original.name=='Торцы картона':continue
         bump=nt.nodes.new('ShaderNodeBump')
-        bump.inputs['Strength'].default_value=.14
-        bump.inputs['Distance'].default_value=.000018
-        nt.links.new(noise.outputs['Fac'],bump.inputs['Height'])
-        # A broad, analytic softbox highlight suits the flat promo style.
-        # It follows the actual surface normal and paper bump, without grainy rays.
+        bump.label='Неглубокий рельеф волокон под ламинацией'
+        bump.inputs['Strength'].default_value=.28
+        bump.inputs['Distance'].default_value=.000075
+        nt.links.new(pulp,bump.inputs['Height'])
         geometry=nt.nodes.new('ShaderNodeNewGeometry')
-        light_vector=nt.nodes.new('ShaderNodeVectorMath');light_vector.operation='SUBTRACT'
-        light_vector.inputs[0].default_value=(-.16,.12,.55)
-        nt.links.new(geometry.outputs['Position'],light_vector.inputs[1])
-        light_direction=nt.nodes.new('ShaderNodeVectorMath');light_direction.operation='NORMALIZE'
-        nt.links.new(light_vector.outputs[0],light_direction.inputs[0])
-        facing=nt.nodes.new('ShaderNodeVectorMath');facing.operation='DOT_PRODUCT'
-        nt.links.new(geometry.outputs['Normal'],facing.inputs[0])
-        nt.links.new(geometry.outputs['Incoming'],facing.inputs[1])
-        sign=nt.nodes.new('ShaderNodeMath');sign.operation='SIGN'
-        nt.links.new(facing.outputs['Value'],sign.inputs[0])
-        view=nt.nodes.new('ShaderNodeVectorMath');view.operation='SCALE'
-        nt.links.new(geometry.outputs['Incoming'],view.inputs[0])
-        nt.links.new(sign.outputs[0],view.inputs['Scale'])
-        half_sum=nt.nodes.new('ShaderNodeVectorMath');half_sum.operation='ADD'
-        nt.links.new(light_direction.outputs[0],half_sum.inputs[0])
-        nt.links.new(view.outputs[0],half_sum.inputs[1])
-        half_direction=nt.nodes.new('ShaderNodeVectorMath');half_direction.operation='NORMALIZE'
-        nt.links.new(half_sum.outputs[0],half_direction.inputs[0])
-        cosine=nt.nodes.new('ShaderNodeVectorMath');cosine.operation='DOT_PRODUCT'
-        nt.links.new(bump.outputs['Normal'],cosine.inputs[0])
-        nt.links.new(half_direction.outputs[0],cosine.inputs[1])
-        positive=nt.nodes.new('ShaderNodeMath');positive.operation='MAXIMUM'
-        positive.inputs[1].default_value=0
-        nt.links.new(cosine.outputs['Value'],positive.inputs[0])
-        power=nt.nodes.new('ShaderNodeMath');power.operation='POWER';power.inputs[1].default_value=16
-        nt.links.new(positive.outputs[0],power.inputs[0])
-        strength=nt.nodes.new('ShaderNodeMath');strength.operation='MULTIPLY';strength.inputs[1].default_value=.012
-        nt.links.new(power.outputs[0],strength.inputs[0])
+        relative=nt.nodes.new('ShaderNodeTexCoord');relative.object=softbox
+        light_direction=vector_node('NORMALIZE',vector_node('MULTIPLY',relative.outputs['Object'],(-1,-1,-1)))
+        half_direction=vector_node('NORMALIZE',vector_node('ADD',light_direction,geometry.outputs['Incoming']))
+        sign=math_node('SIGN',vector_node('DOT_PRODUCT',geometry.outputs['Normal'],geometry.outputs['Incoming']))
+        oriented=nt.nodes.new('ShaderNodeVectorMath');oriented.operation='SCALE'
+        nt.links.new(bump.outputs['Normal'],oriented.inputs[0]);nt.links.new(sign,oriented.inputs['Scale'])
+        tangent=nt.nodes.new('ShaderNodeTangent');tangent.direction_type='UV_MAP';tangent.uv_map='OutsideUV'
+        # Project the tangent onto the bumped surface, so the fibres actually
+        # modulate the narrow direction of the reflected strip as well.
+        tangent_dot=vector_node('DOT_PRODUCT',oriented.outputs[0],tangent.outputs[0])
+        projection=nt.nodes.new('ShaderNodeVectorMath');projection.operation='SCALE'
+        nt.links.new(oriented.outputs[0],projection.inputs[0]);nt.links.new(tangent_dot,projection.inputs['Scale'])
+        paper_tangent=vector_node('NORMALIZE',vector_node('SUBTRACT',tangent.outputs[0],projection.outputs[0]))
+        bitangent=vector_node('NORMALIZE',vector_node('CROSS_PRODUCT',oriented.outputs[0],paper_tangent))
+        across=vector_node('DOT_PRODUCT',half_direction,paper_tangent)
+        along=vector_node('DOT_PRODUCT',half_direction,bitangent)
+        width=math_node('MULTIPLY',math_node('MULTIPLY',across,across),260)
+        length=math_node('MULTIPLY',math_node('MULTIPLY',along,along),9)
+        exponent=math_node('MULTIPLY',math_node('ADD',width,length),-1)
+        lobe=math_node('POWER',math.e,exponent,label='Продолговатый блик софтбокса')
+        front=math_node('GREATER_THAN',vector_node('DOT_PRODUCT',oriented.outputs[0],half_direction),.01)
+        strength=math_node('MULTIPLY',math_node('MULTIPLY',lobe,front),.16,label='Глянцевая ламинация')
         glossy=nt.nodes.new('ShaderNodeEmission')
+        glossy.label='Отражение на покрытии'
         glossy.inputs['Color'].default_value=(1,1,1,1)
-        nt.links.new(strength.outputs[0],glossy.inputs['Strength'])
+        nt.links.new(strength,glossy.inputs['Strength'])
         addition=nt.nodes.new('ShaderNodeAddShader')
         nt.links.new(emission.outputs[0],addition.inputs[0])
         nt.links.new(glossy.outputs[0],addition.inputs[1])
