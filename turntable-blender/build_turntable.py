@@ -130,9 +130,74 @@ def brushed_gold(name, radial):
     return material
 
 
+def walnut_veneer():
+    material, bsdf = surface("Dark walnut | satin veneer", "462215", 0.38, coat=0.18)
+    nodes, links = material.node_tree.nodes, material.node_tree.links
+    p = coords(material)
+    p.node.location = (-1250, 180)
+    bsdf.location = (570, 200)
+    nodes.get("Material Output").location = (900, 200)
+
+    def vector_math(operation, a, b, label, location):
+        node = nodes.new("ShaderNodeVectorMath")
+        node.operation = operation
+        node.label = label
+        node.location = location
+        links.new(a, node.inputs[0])
+        if hasattr(b, "is_output"):
+            links.new(b, node.inputs[1])
+        else:
+            node.inputs[1].default_value = b
+        return node.outputs["Vector"]
+
+    # Offset the trunk axis from the veneer cut for broad, nearly horizontal figure.
+    distortion = noise(material, p, 10.5, (-1040, 590), detail=3)
+    drift = vector_math('MULTIPLY', distortion, (0, 0.019, -0.022),
+                        "Subtle irregularity in the cut", (-820, 590))
+    warped = vector_math('ADD', p, drift, "Warped trunk coordinates", (-610, 590))
+    cross_section = vector_math('MULTIPLY', warped, (0, 1, 1),
+                                "Trunk axis along the chassis", (-405, 590))
+    center = vector_math('ADD', cross_section, (0, 0.245, 0.105),
+                         "Off-centre veneer slice", (-200, 625))
+    radius = nodes.new("ShaderNodeVectorMath")
+    radius.operation = 'LENGTH'
+    radius.location = (0, 610)
+    links.new(center, radius.inputs[0])
+    growth = noise(material, radius.outputs["Value"], 260, (195, 610), detail=2)
+    fiber_domain = vector_math('MULTIPLY', warped, (13, 770, 660),
+                               "Longitudinal wood fibres", (-415, 155))
+    fibers = noise(material, fiber_domain, 1.0, (-185, 155), detail=3)
+    figure = nodes.new("ShaderNodeMixRGB")
+    figure.label = "Growth figure and strands"
+    figure.location = (180, 270)
+    figure.inputs[0].default_value = 0.52
+    links.new(growth, figure.inputs[1])
+    links.new(fibers, figure.inputs[2])
+    color = ramp(material, figure.outputs["Color"], "221009", "713923", (370, 440))
+    color.node.label = "Warm walnut heartwood"
+    colors = color.node.color_ramp
+    for position, color_hex in ((0.25, "2D170F"), (0.47, "452215"), (0.68, "60311F")):
+        colors.elements.new(position).color = srgb(color_hex)
+    links.new(color, bsdf.inputs["Base Color"])
+
+    pore_domain = vector_math('MULTIPLY', p, (205, 4970, 4230),
+                              "Fine pores under satin finish", (-610, -230))
+    pores = noise(material, pore_domain, 1.0, (-380, -230), detail=2)
+    relief = bump(material, bsdf, fibers, 0.024, 0.20, (35, -105))
+    bump(material, bsdf, pores, 0.012, 0.27, (300, -105), normal=relief)
+    roughness = nodes.new("ShaderNodeMapRange")
+    roughness.label = "Satin roughness"
+    roughness.location = (70, -430)
+    roughness.inputs["To Min"].default_value = 0.32
+    roughness.inputs["To Max"].default_value = 0.45
+    links.new(fibers, roughness.inputs["Value"])
+    links.new(roughness.outputs["Result"], bsdf.inputs["Roughness"])
+    return material
+
+
 def make_materials():
     colors = {
-        'burgundy': grain("Burgundy lacquer", "653844", "562E3B", "72434E", 0.40, 6000, 0.022, coat=0.21),
+        'plinth': walnut_veneer(),
         'rim': brushed_gold("Matte gold | circular brush", True),
         'tube': brushed_gold("Matte gold | satin tube", False),
         'edge': surface("Champagne gold | machined edges", "E3B87D", 0.24, 0.95)[0],
@@ -318,7 +383,7 @@ def make_body(c, feet, rear, hinges, cutters, m):
         ("Burgundy die-cast plinth", [(453.2, 348.2, 7.3, 17.3), (454.4, 349.4, 7.7, 18.1),
                                     (455, 350, 8, 19.2), (455, 350, 8, 43.9),
                                     (454.5, 349.5, 7.8, 45.0), (453, 348, 7.1, 46.05),
-                                    (451.6, 346.6, 6.5, DECK_TOP)], m['burgundy']),
+                                    (451.6, 346.6, 6.5, DECK_TOP)], m['plinth']),
     ]:
         obj = loft(name, [rounded_rect(*profile) for profile in profiles], c, material)
         normal = obj.modifiers.new("Face-weighted normals", 'WEIGHTED_NORMAL')
